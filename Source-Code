@@ -1,0 +1,693 @@
+/**
+ * ============================================================
+ *  GL868_ESP32_IVRS — Interactive Voice Response System
+ *  Hardware: ESP32-S3 (4MB Flash, 2MB PSRAM) + SIM868
+ * ============================================================
+ *  Pin Map:
+ *    SIM868 UART   → GPIO17 (TX) / GPIO18 (RX)
+ *    SIM868 PWRKEY → GPIO42
+ *    SIM868 RI     → GPIO16
+ *    Audio Out     → GPIO38 → Sallen-Key LPF (MCP6002/LMV358)
+ *                          → 47kΩ/2kΩ divider → SIM868 MIC+
+ *    Output 1      → GPIO4   (e.g. Relay / Light 1)
+ *    Output 2      → GPIO5   (e.g. Relay / Light 2)
+ *    Status LED    → GPIO47
+ *    Battery ADC   → GPIO1
+ *
+ *  Audio:
+ *    Sigma-Delta on GPIO38, recovered by external LPF.
+ *    Files in LittleFS /audio/*.raw
+ *    Format: 8000 Hz, 8-bit Unsigned PCM, Mono, RAW (no header)
+ *
+ *  IVRS Key Map (during call):
+ *    1 → Output 1 ON       2 → Output 1 OFF
+ *    3 → Output 2 ON       4 → Output 2 OFF
+ *    * → Repeat menu       # → End call
+ *
+ *  To add more outputs: increase OUT_COUNT and fill OUT_PINS[].
+ * ============================================================
+ */
+
+#include <Arduino.h>
+#include <LittleFS.h>
+#include <GL868_ESP32.h>
+
+// ── Pin Map ──────────────────────────────────────────────────────────────────
+#define PIN_AUDIO_OUT 38 // Sigma-delta → LPF → SIM868 MIC+
+
+// ── Controlled Outputs ───────────────────────────────────────────────────────
+// To add outputs: increase OUT_COUNT, add a pin, name, and two audio file
+// paths.
+#define OUT_COUNT 2
+static const uint8_t OUT_PINS[OUT_COUNT] = {4, 5};
+static const char *OUT_NAMES[OUT_COUNT] = {"Output 1", "Output 2"};
+
+// ── Serial ───────────────────────────────────────────────────────────────────
+#define SIM_SERIAL (GeoLinker.modem.getSerial())
+#define USB_SERIAL Serial
+#define USB_BAUD 115200
+
+// ── Timing ───────────────────────────────────────────────────────────────────
+#define BOOT_TIMEOUT_MS 35000
+#define AT_TIMEOUT_MS 3000
+#define ANSWER_AFTER_RINGS 1 // auto-answer after this many rings
+#define DTMF_WAIT_MS 30000   // hang up if no key within this time
+
+// ── Audio file paths ─────────────────────────────────────────────────────────
+// Shared prompts
+#define AUD_WELCOME "/audio/welcome.raw"
+#define AUD_MENU "/audio/menu.raw"
+#define AUD_INVALID "/audio/invalid.raw"
+#define AUD_GOODBYE "/audio/goodbye.raw"
+// Per-output confirmation — rename the filenames here to match what you record
+#define AUD_OUTPUT1_ON "/audio/output1_on.raw"
+#define AUD_OUTPUT1_OFF "/audio/output1_off.raw"
+#define AUD_OUTPUT2_ON "/audio/output2_on.raw"
+#define AUD_OUTPUT2_OFF "/audio/output2_off.raw"
+
+// Lookup tables (reference the #defines above — no need to edit these)
+static const char *OUT_AUDIO_ON[OUT_COUNT] = {AUD_OUTPUT1_ON, AUD_OUTPUT2_ON};
+static const char *OUT_AUDIO_OFF[OUT_COUNT] = {AUD_OUTPUT1_OFF,
+                                               AUD_OUTPUT2_OFF};
+
+// ── Audio engine constants
+// ────────────────────────────────────────────────────
+#define AUDIO_SAMPLE_HZ 8000 // playback sample rate
+#define SD_CARRIER_HZ 312500 // sigma-delta carrier frequency
+#define AUDIO_SILENCE 128    // 50% duty = DC bias = no audio
+
+// ════════════════════════════════════════════════════════════════════════════
+//  GLOBALS
+// ════════════════════════════════════════════════════════════════════════════
+// Audio playback
+static volatile uint8_t *g_audioBuf = nullptr;
+static volatile size_t g_audioLen = 0;
+static volatile size_t g_audioPos = 0;
+static volatile bool g_audioPlaying = false;
+static hw_timer_t *g_audioTimer = nullptr;
+
+// IVRS state
+typedef enum {
+  IVRS_IDLE,
+  IVRS_PLAYING_WELCOME,
+  IVRS_PLAYING_MENU,
+  IVRS_WAITING_DTMF,
+  IVRS_HANGING_UP
+} ivrs_state_t;
+
+static ivrs_state_t g_ivrsState = IVRS_IDLE;
+static volatile char g_dtmfKey = 0;
+static uint32_t g_dtmfTimer = 0;
+
+// SIM868 state
+static bool g_simReady = false;
+static bool g_inCall = false;
+static uint8_t g_ringCount = 0;
+static volatile bool g_riTriggered = false;
+
+// ── Forward declarations ─────────────────────────────────────────────────────
+void sim_configure();
+bool sim_at(const char *cmd, const char *expect,
+            uint32_t timeout_ms = AT_TIMEOUT_MS, String *out = nullptr);
+String sim_read(uint32_t timeout_ms = AT_TIMEOUT_MS);
+void sim_flush();
+void do_answer();
+void do_hangup();
+void handle_urc(const String &urc);
+
+bool audio_load(const char *path);
+void audio_play();
+void audio_stop();
+void audio_wait(uint32_t timeout_ms = 30000);
+void audio_play_file(const char *path);
+
+void ivrs_run();
+void ivrs_call_answered();
+void ivrs_call_ended();
+void ivrs_handle_dtmf(char key);
+
+void led_status(bool on);
+void IRAM_ATTR ri_isr();
+void IRAM_ATTR audio_isr();
+
+// ── Custom RGB LED ───────────────────────────────────────────────────────────
+enum CustomLED { L_OFF, L_BOOT, L_INIT, L_IDLE, L_RING, L_CALL, L_ERR };
+CustomLED g_rgbState = L_OFF;
+void set_rgb(CustomLED s) { g_rgbState = s; }
+
+void rgb_run() {
+  static uint32_t lastTick = 0;
+  static uint32_t blinkPhase = 0;
+  static CustomLED lastState = L_OFF;
+  uint32_t now = millis();
+
+  if (g_rgbState != lastState) {
+    lastState = g_rgbState;
+    lastTick = 0; // Force immediate update
+    blinkPhase = 0;
+  }
+  
+  switch(g_rgbState) {
+    case L_OFF:
+      if (lastTick == 0) {
+        neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 0);
+        lastTick = now;
+      }
+      break;
+    case L_BOOT: // Yellow
+      if (lastTick == 0) {
+        neopixelWrite(GL868_ESP32_WS2812B_PIN, 32, 32, 0);
+        lastTick = now;
+      }
+      break;
+    case L_INIT: // Magenta blink
+      if (lastTick == 0 || now - lastTick > (blinkPhase ? 250 : 1750)) {
+        lastTick = now;
+        blinkPhase = !blinkPhase;
+        if (blinkPhase) neopixelWrite(GL868_ESP32_WS2812B_PIN, 32, 0, 32);
+        else neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 0);
+      }
+      break;
+    case L_IDLE: // Green blink
+      if (lastTick == 0 || now - lastTick > (blinkPhase ? 250 : 1750)) {
+        lastTick = now;
+        blinkPhase = !blinkPhase;
+        if (blinkPhase) neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 32, 0); 
+        else neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 0);
+      }
+      break;
+    case L_RING: // R G B flash
+      {
+        uint32_t p = (now / 150) % 4;
+        if (lastTick == 0 || p != blinkPhase) {
+          lastTick = now;
+          blinkPhase = p;
+          if (p == 0) neopixelWrite(GL868_ESP32_WS2812B_PIN, 32, 0, 0);
+          else if (p == 1) neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 32, 0);
+          else if (p == 2) neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 32);
+          else neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 0);
+        }
+      }
+      break;
+    case L_CALL: // Blue blink
+      if (lastTick == 0 || now - lastTick > (blinkPhase ? 250 : 1750)) {
+        lastTick = now;
+        blinkPhase = !blinkPhase;
+        if (blinkPhase) neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 32);
+        else neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 0);
+      }
+      break;
+    case L_ERR: // Red
+      if (lastTick == 0 || now - lastTick > 200) {
+        lastTick = now;
+        blinkPhase = !blinkPhase;
+        if (blinkPhase) neopixelWrite(GL868_ESP32_WS2812B_PIN, 32, 0, 0);
+        else neopixelWrite(GL868_ESP32_WS2812B_PIN, 0, 0, 0);
+      }
+      break;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AUDIO ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+
+void IRAM_ATTR audio_isr() {
+  if (g_audioPlaying) {
+    if (g_audioPos < g_audioLen) {
+      sigmaDeltaWrite(PIN_AUDIO_OUT, g_audioBuf[g_audioPos++]);
+    } else {
+      g_audioPlaying = false;
+      sigmaDeltaWrite(PIN_AUDIO_OUT, AUDIO_SILENCE);
+    }
+  }
+}
+
+void audio_init() {
+  sigmaDeltaAttach(PIN_AUDIO_OUT, SD_CARRIER_HZ);
+  sigmaDeltaWrite(PIN_AUDIO_OUT, AUDIO_SILENCE);
+  // Timer fires at AUDIO_SAMPLE_HZ to push next sample
+  g_audioTimer = timerBegin(1000000UL); // 1 MHz base
+  timerAttachInterrupt(g_audioTimer, &audio_isr);
+  timerAlarm(g_audioTimer, 1000000UL / AUDIO_SAMPLE_HZ, true, 0);
+  USB_SERIAL.println(F("[AUDIO] init OK — 8 kHz sigma-delta on GPIO38"));
+}
+
+// Load file from LittleFS into PSRAM (falls back to heap)
+bool audio_load(const char *path) {
+  audio_stop();
+  File f = LittleFS.open(path, "r");
+  if (!f) {
+    USB_SERIAL.printf("[AUDIO] Not found: %s\n", path);
+    return false;
+  }
+  size_t len = f.size();
+  if (len == 0) {
+    f.close();
+    return false;
+  }
+
+  if (g_audioBuf) {
+    free((void *)g_audioBuf);
+    g_audioBuf = nullptr;
+  }
+
+  // Prefer PSRAM so we don't fragment heap
+  uint8_t *buf = (uint8_t *)ps_malloc(len);
+  if (!buf)
+    buf = (uint8_t *)malloc(len);
+  if (!buf) {
+    USB_SERIAL.printf("[AUDIO] OOM: %u bytes for %s\n", (unsigned)len, path);
+    f.close();
+    return false;
+  }
+  f.read(buf, len);
+  f.close();
+  g_audioBuf = buf;
+  g_audioLen = len;
+  g_audioPos = 0;
+  USB_SERIAL.printf("[AUDIO] Loaded %s (%u B)\n", path, (unsigned)len);
+  return true;
+}
+
+void audio_play() {
+  if (g_audioBuf && g_audioLen > 0) {
+    g_audioPos = 0;
+    g_audioPlaying = true;
+  }
+}
+
+void audio_stop() {
+  g_audioPlaying = false;
+  sigmaDeltaWrite(PIN_AUDIO_OUT, AUDIO_SILENCE);
+}
+
+// Block until done or timeout; drains SIM868 URCs while waiting.
+// Stops immediately if a DTMF key arrives (barge-in / type-ahead).
+void audio_wait(uint32_t timeout_ms) {
+  uint32_t start = millis();
+  while (g_audioPlaying) {
+    rgb_run();
+    if (millis() - start > timeout_ms) {
+      audio_stop();
+      return;
+    }
+    if (g_dtmfKey) {
+      audio_stop();
+      return;
+    } // DTMF received → stop audio now
+    if (SIM_SERIAL.available()) {
+      String u = sim_read(100);
+      if (u.length())
+        handle_urc(u);
+    }
+    delay(5);
+  }
+  delay(150); // brief inter-phrase gap
+}
+
+// Convenience: load → play → wait (no-op if file missing)
+void audio_play_file(const char *path) {
+  if (audio_load(path)) {
+    audio_play();
+    audio_wait();
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  IVRS STATE MACHINE
+// ════════════════════════════════════════════════════════════════════════════
+
+void ivrs_run() {
+  switch (g_ivrsState) {
+
+  case IVRS_IDLE:
+    break;
+
+  case IVRS_PLAYING_WELCOME:
+    audio_play_file(AUD_WELCOME);
+    if (!g_inCall)
+      break; // caller hung up during playback
+    g_ivrsState = IVRS_PLAYING_MENU;
+    break; // fall into menu on next loop tick
+
+  case IVRS_PLAYING_MENU:
+    g_dtmfKey = 0; // clear before playing
+    audio_play_file(AUD_MENU);
+    if (!g_inCall)
+      break;
+    g_dtmfTimer = millis();
+    // If barge-in happened during menu, don't clear it!
+    // We go straight to WAITING_DTMF where the loop will catch it instantly.
+    g_ivrsState = IVRS_WAITING_DTMF;
+    break;
+
+  case IVRS_WAITING_DTMF: {
+    char k = g_dtmfKey;
+    if (k) {
+      g_dtmfKey = 0;
+      ivrs_handle_dtmf(k); // handles action + transitions state
+    } else if (millis() - g_dtmfTimer > DTMF_WAIT_MS) {
+      USB_SERIAL.println(F("[IVRS] No key — hanging up."));
+      g_ivrsState = IVRS_HANGING_UP;
+    }
+    break;
+  }
+
+  case IVRS_HANGING_UP:
+    if (g_inCall)
+      audio_play_file(AUD_GOODBYE);
+    do_hangup();
+    g_ivrsState = IVRS_IDLE;
+    break;
+  }
+}
+
+void ivrs_handle_dtmf(char key) {
+  USB_SERIAL.printf("[IVRS] DTMF: '%c'\n", key);
+  audio_stop();
+
+  if (key == '#') {
+    g_ivrsState = IVRS_HANGING_UP;
+    return;
+  }
+  if (key == '*') {
+    g_ivrsState = IVRS_PLAYING_MENU;
+    return;
+  }
+
+  // Keys 1-4 control outputs
+  // Key 1 → OUT[0] ON,  Key 2 → OUT[0] OFF
+  // Key 3 → OUT[1] ON,  Key 4 → OUT[1] OFF
+  // Pattern: key '1' = index 0, turn ON;  key '2' = index 0, turn OFF; etc.
+  int k = key - '1';          // '1'→0 '2'→1 '3'→2 '4'→3
+  int outIdx = k / 2;         // which output (0 or 1)
+  bool turnOn = (k % 2 == 0); // even → ON, odd → OFF
+
+  if (outIdx >= 0 && outIdx < OUT_COUNT) {
+    bool current = digitalRead(OUT_PINS[outIdx]);
+    if (turnOn == (bool)current) {
+      // Already in that state — still play confirmation
+    }
+    digitalWrite(OUT_PINS[outIdx], turnOn ? HIGH : LOW);
+    USB_SERIAL.printf("[IVRS] %s → %s\n", OUT_NAMES[outIdx],
+                      turnOn ? "ON" : "OFF");
+    audio_play_file(turnOn ? OUT_AUDIO_ON[outIdx] : OUT_AUDIO_OFF[outIdx]);
+  } else {
+    audio_play_file(AUD_INVALID);
+  }
+
+  if (g_inCall) {
+    g_dtmfKey = 0;          // clear the consumed key
+    g_dtmfTimer = millis(); // reset timeout
+    g_ivrsState = IVRS_WAITING_DTMF;
+  }
+}
+
+void ivrs_call_answered() {
+  USB_SERIAL.println(F("[IVRS] Call answered — IVRS starting."));
+  // Enable DTMF detection; SIM868 sends +DTMF: X URC
+  sim_at("AT+DDET=1,0,1", "OK", 3000);
+  // Reduce mic gain — our line-level signal is much stronger than a mic
+  sim_at("AT+CMIC=0,10", "OK");
+  g_ivrsState = IVRS_PLAYING_WELCOME;
+}
+
+void ivrs_call_ended() {
+  USB_SERIAL.println(F("[IVRS] Call ended."));
+  audio_stop();
+  g_inCall = false;
+  g_ringCount = 0;
+  g_dtmfKey = 0;
+  g_ivrsState = IVRS_IDLE;
+  sim_at("AT+DDET=0", "OK", 2000); // disable DTMF detection
+  set_rgb(L_IDLE);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SIM868 POWER & BOOT
+// ════════════════════════════════════════════════════════════════════════════
+
+
+
+// Wait for SIM868 to register on the GSM network.
+// Returns TRUE  → Registered Home or Roaming (or Timeout override)
+bool sim_wait_ready() {
+  USB_SERIAL.print(F("[SIM] Waiting for network registration"));
+  uint32_t start = millis();
+  while (millis() - start < 15000) {
+    sim_flush();
+    SIM_SERIAL.println("AT+CREG?");
+    String r = sim_read(1000);
+    if (r.indexOf("+CREG: 0,1") >= 0 || r.indexOf("+CREG: 0,5") >= 0 ||
+        r.indexOf("+CREG: 1,1") >= 0 || r.indexOf("+CREG: 1,5") >= 0 ||
+        r.indexOf("+CREG: 2,1") >= 0 || r.indexOf("+CREG: 2,5") >= 0) {
+      USB_SERIAL.println(F("\n[SIM] Registered!"));
+      return true;
+    }
+    USB_SERIAL.print('.');
+    uint32_t waitStart = millis();
+    while (millis() - waitStart < 1000) {
+      rgb_run();
+      delay(10);
+    }
+  }
+  USB_SERIAL.println(F("\n[SIM] Registration timeout/failed, proceeding anyway..."));
+  return true;
+}
+
+void sim_configure() {
+  sim_at("ATE0", "OK");
+  sim_at("AT+CMGF=1", "OK");
+  sim_at("AT+CNMI=2,1,0,0,0", "OK");
+  sim_at("AT+CLIP=1", "OK");
+  sim_at("AT+CLVL=80", "OK");   // speaker volume
+  sim_at("AT+CMIC=0,10", "OK"); // mic gain
+  sim_at("AT+DDET=0", "OK");    // DTMF off until call
+
+  // Fix: only detach if previously attached, avoids GPIO ISR error on first
+  // boot
+  static bool s_riAttached = false;
+  if (s_riAttached)
+    detachInterrupt(digitalPinToInterrupt(GL868_ESP32_RI_PIN_DEFAULT));
+  attachInterrupt(digitalPinToInterrupt(GL868_ESP32_RI_PIN_DEFAULT), ri_isr, FALLING);
+  s_riAttached = true;
+
+  g_simReady = true;
+  g_inCall = false;
+  g_ringCount = 0;
+  set_rgb(L_IDLE);
+  USB_SERIAL.println(F("[SIM] Ready.\n[IVRS] Waiting for calls..."));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SIM868 AT HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+bool sim_at(const char *cmd, const char *expect, uint32_t timeout_ms,
+            String *out) {
+  sim_flush();
+  SIM_SERIAL.println(cmd);
+  String resp = sim_read(timeout_ms);
+  if (out)
+    *out = resp;
+  bool ok = resp.indexOf(expect) >= 0;
+  USB_SERIAL.printf("[AT] %-28s → %s\n", cmd, ok ? "OK" : "FAIL");
+  return ok;
+}
+
+String sim_read(uint32_t timeout_ms) {
+  String r;
+  uint32_t deadline = millis() + timeout_ms;
+  while (millis() < deadline) {
+    rgb_run();
+    while (SIM_SERIAL.available()) {
+      r += (char)SIM_SERIAL.read();
+      deadline = millis() + 50;
+    }
+    delay(1);
+  }
+  r.trim();
+  return r;
+}
+
+void sim_flush() {
+  delay(30);
+  while (SIM_SERIAL.available())
+    SIM_SERIAL.read();
+}
+
+void do_answer() {
+  USB_SERIAL.println(F("[SIM] Answering..."));
+  if (sim_at("ATA", "OK", 8000)) {
+    set_rgb(L_CALL);
+    g_inCall = true;
+    g_ringCount = 0;
+    ivrs_call_answered();
+  }
+}
+
+void do_hangup() {
+  sim_at("ATH", "OK", 5000);
+  ivrs_call_ended();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  URC HANDLER — receives all unsolicited modem messages
+// ════════════════════════════════════════════════════════════════════════════
+
+void handle_urc(const String &urc) {
+  if (!urc.length())
+    return;
+  USB_SERIAL.print(F("[SIM] "));
+  USB_SERIAL.println(urc);
+
+  // ── Incoming ring ────────────────────────────────────────────────────
+  if (urc.indexOf("RING") >= 0 && !g_inCall) {
+    set_rgb(L_RING);
+    g_ringCount++;
+    USB_SERIAL.printf("[IVRS] Ring #%d\n", g_ringCount);
+    if (g_ringCount >= ANSWER_AFTER_RINGS)
+      do_answer();
+  }
+
+  // ── DTMF: +DTMF: X ───────────────────────────────────────────────────
+  if (urc.indexOf("+DTMF:") >= 0) {
+    int p = urc.indexOf("+DTMF:");
+    String s = urc.substring(p + 6);
+    s.trim();
+    if (s.length() > 0) {
+      g_dtmfKey = s.charAt(0);
+      USB_SERIAL.printf("[IVRS] DTMF captured: '%c'\n", g_dtmfKey);
+    }
+  }
+
+  // ── Call dropped by remote ────────────────────────────────────────────
+  if (urc.indexOf("NO CARRIER") >= 0 || urc.indexOf("NO ANSWER") >= 0 ||
+      urc.indexOf("BUSY") >= 0) {
+    if (g_inCall)
+      ivrs_call_ended();
+    g_ringCount = 0;
+  }
+
+  // ── SIM868 unexpected power-down ─────────────────────────────────────
+  if (urc.indexOf("NORMAL POWER DOWN") >= 0) {
+    g_simReady = false;
+    if (g_inCall)
+      ivrs_call_ended();
+    USB_SERIAL.println(F("[SIM] Power down! Restarting in 3 s..."));
+    set_rgb(L_ERR);
+    delay(3000);
+    set_rgb(L_BOOT);
+    if (GeoLinker.modem.powerOn()) {
+      sim_wait_ready(); // wait for audio/SMS subsystem before configuring
+      sim_configure();
+    } else {
+      USB_SERIAL.println(F("[FATAL] SIM868 did not recover!"));
+      set_rgb(L_ERR);
+      while (true) {
+        delay(100);
+      }
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════════════════════
+
+void setup() {
+  USB_SERIAL.begin(USB_BAUD);
+  delay(400);
+  USB_SERIAL.println(
+      F("\n[IVRS] ============================================"));
+  USB_SERIAL.println(F("[IVRS]  GL868_ESP32_IVRS  —  ESP32-S3 + SIM868"));
+  USB_SERIAL.println(F("[IVRS] ============================================"));
+
+  // Initialise RGB LED manually
+  pinMode(GL868_ESP32_WS2812B_POWER_PIN, OUTPUT);
+  digitalWrite(GL868_ESP32_WS2812B_POWER_PIN, HIGH);
+  delay(10);
+  set_rgb(L_BOOT);
+
+  pinMode(GL868_ESP32_RI_PIN_DEFAULT, INPUT_PULLUP);
+
+  // Initialise controlled output GPIOs
+  for (int i = 0; i < OUT_COUNT; i++) {
+    pinMode(OUT_PINS[i], OUTPUT);
+    digitalWrite(OUT_PINS[i], LOW);
+    USB_SERIAL.printf("[IVRS] %s → GPIO%d = OFF\n", OUT_NAMES[i], OUT_PINS[i]);
+  }
+
+  // LittleFS
+  if (!LittleFS.begin(true)) {
+    USB_SERIAL.println(
+        F("[FS]   LittleFS MOUNT FAILED — audio will not play!"));
+  } else {
+    USB_SERIAL.println(F("[FS]   LittleFS mounted OK."));
+    // List audio files present
+    File root = LittleFS.open("/audio");
+    if (root && root.isDirectory()) {
+      File f = root.openNextFile();
+      while (f) {
+        USB_SERIAL.printf("[FS]   Found: /audio/%s (%u B)\n", f.name(),
+                          (unsigned)f.size());
+        f = root.openNextFile();
+      }
+    } else {
+      USB_SERIAL.println(
+          F("[FS]   /audio not found — upload audio files via LittleFS tool!"));
+    }
+  }
+
+  // SIM868 UART
+  GeoLinker.modem.begin();
+  delay(100);
+
+  // Audio engine
+  audio_init();
+
+  // SIM868 power-on + boot + configuration
+  // Retry loop: handles the case where modem powers down mid-startup
+  while (true) {
+    set_rgb(L_BOOT);
+    if (!GeoLinker.modem.powerOn()) {
+      USB_SERIAL.println(F("[FATAL] SIM868 boot failed!"));
+      set_rgb(L_ERR);
+      while (true) {
+        delay(100);
+      }
+    }
+    set_rgb(L_INIT);
+    if (sim_wait_ready())
+      break; // ready → proceed to configure
+    // NORMAL POWER DOWN during wait — pulse power and retry
+    USB_SERIAL.println(F("[SIM] Retrying boot in 3 s..."));
+    delay(3000);
+  }
+  sim_configure();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ════════════════════════════════════════════════════════════════════════════
+
+void loop() {
+  // Service SIM868 URCs
+  if (SIM_SERIAL.available()) {
+    String urc = sim_read(400);
+    if (urc.length())
+      handle_urc(urc);
+  }
+  // Advance IVRS state machine
+  ivrs_run();
+  
+  // Advance RGB state
+  rgb_run();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  MISC
+// ════════════════════════════════════════════════════════════════════════════
+
+void IRAM_ATTR ri_isr() { g_riTriggered = true; }
