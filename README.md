@@ -60,7 +60,7 @@ When a user calls the system:
 
 | S.No | Component       | Quantity | Purpose |
 |------|-----------------|----------|---------|
-| 1    | MCP6002 Op-Amp  | 1        | Amplifies and filters the audio signal |
+| 1    | MCP602 Op-Amp  | 1        | Amplifies and filters the audio signal |
 | 2    | 47kΩ Resistor   | 1        | Voltage divider to reduce audio signal before MIC input |
 | 3    | 2.2kΩ Resistor  | 1        | Works with 47kΩ to scale down microphone input signal |
 | 4    | 1nF Capacitor   | 3        | Low-pass filter to remove high-frequency noise |
